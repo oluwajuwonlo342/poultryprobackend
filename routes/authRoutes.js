@@ -2,19 +2,19 @@ const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
 const { protect } = require('../middleware/authMiddleware');
-const {
-  registerUser,
-  loginUser,
-  getMe,
-  forgotPassword,
-  resetPassword,
-} = require('../controllers/authController');
+const authController = require('../controllers/authController');
 
-router.post('/register', registerUser);
-router.post('/login', loginUser);
-router.get('/me', protect, getMe);
-router.post('/forgot-password', forgotPassword);
-router.post('/reset-password', resetPassword);
+const registerHandler = authController.registerUser || authController.register;
+const loginHandler = authController.loginUser || authController.login;
+const getMeHandler = authController.getMe || authController.me;
+const forgotPasswordHandler = authController.forgotPassword;
+const resetPasswordHandler = authController.resetPassword;
+
+if (registerHandler) router.post('/register', registerHandler);
+if (loginHandler) router.post('/login', loginHandler);
+if (getMeHandler) router.get('/me', protect, getMeHandler);
+if (forgotPasswordHandler) router.post('/forgot-password', forgotPasswordHandler);
+if (resetPasswordHandler) router.post('/reset-password', resetPasswordHandler);
 
 // Update personal profile (fullName & phone)
 router.put('/profile', protect, async (req, res, next) => {
