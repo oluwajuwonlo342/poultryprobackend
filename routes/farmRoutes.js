@@ -2,12 +2,13 @@ const express = require('express');
 const router = express.Router();
 const { protect, requireRole } = require('../middleware/authMiddleware');
 const { authorizeFarmAccess } = require('../middleware/farmAccessMiddleware');
+const { checkPlanQuota } = require('../middleware/subscriptionMiddleware');
 const Farm = require('../models/Farm');
 const FarmMembership = require('../models/FarmMembership');
 const User = require('../models/User');
 
-// Create a new farm (Farm Owners)
-router.post('/', protect, requireRole('farm_owner'), async (req, res, next) => {
+// Create a new farm (enforces maxFarms quota)
+router.post('/', protect, requireRole('farm_owner'), checkPlanQuota('farms'), async (req, res, next) => {
   try {
     const farm = await Farm.create({ ...req.body, owner: req.user._id });
     res.status(201).json(farm);
@@ -41,39 +42,45 @@ router.put('/:farmId', protect, authorizeFarmAccess(), async (req, res, next) =>
   }
 });
 
-// Worker Management: Invite / Assign Worker to Farm
-router.post('/:farmId/workers', protect, authorizeFarmAccess(), async (req, res, next) => {
-  try {
-    if (!req.isFarmOwner) return res.status(403).json({ message: 'Only farm owners can invite workers.' });
-    const { fullName, email, phone, password, jobTitle, permissions } = req.body;
+// Invite / Assign Worker to Farm (enforces maxWorkers quota)
+router.post(
+  '/:farmId/workers',
+  protect,
+  authorizeFarmAccess(),
+  checkPlanQuota('workers'),
+  async (req, res, next) => {
+    try {
+      if (!req.isFarmOwner) return res.status(403).json({ message: 'Only farm owners can invite workers.' });
+      const { fullName, email, phone, password, jobTitle, permissions } = req.body;
 
-    let workerUser = await User.findOne({ email: email.toLowerCase() });
-    if (!workerUser) {
-      workerUser = await User.create({
-        fullName,
-        email,
-        phone,
-        password: password || 'Worker@123',
-        role: 'farm_worker',
-      });
+      let workerUser = await User.findOne({ email: email.toLowerCase() });
+      if (!workerUser) {
+        workerUser = await User.create({
+          fullName,
+          email,
+          phone,
+          password: password || 'Worker@123',
+          role: 'farm_worker',
+        });
+      }
+
+      const membership = await FarmMembership.findOneAndUpdate(
+        { farm: req.farmId, user: workerUser._id },
+        {
+          invitedBy: req.user._id,
+          jobTitle: jobTitle || 'Farm Attendant',
+          permissions,
+          status: 'active',
+        },
+        { upsert: true, new: true }
+      ).populate('user', 'fullName email phone accountStatus');
+
+      res.status(201).json(membership);
+    } catch (err) {
+      next(err);
     }
-
-    const membership = await FarmMembership.findOneAndUpdate(
-      { farm: req.farmId, user: workerUser._id },
-      {
-        invitedBy: req.user._id,
-        jobTitle: jobTitle || 'Farm Attendant',
-        permissions,
-        status: 'active',
-      },
-      { upsert: true, new: true }
-    ).populate('user', 'fullName email phone accountStatus');
-
-    res.status(201).json(membership);
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 // List farm workers
 router.get('/:farmId/workers', protect, authorizeFarmAccess(), async (req, res, next) => {
