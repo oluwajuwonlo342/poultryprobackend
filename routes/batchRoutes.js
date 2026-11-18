@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const { authorizeFarmAccess } = require('../middleware/farmAccessMiddleware');
+const { checkPlanQuota } = require('../middleware/subscriptionMiddleware');
 const {
   createBatch,
   getBatchesWithMetrics,
@@ -11,7 +12,7 @@ const Batch = require('../models/Batch');
 
 router.use(protect, authorizeFarmAccess('viewBatches'));
 
-router.post('/', createBatch);
+router.post('/', checkPlanQuota('batches'), createBatch);
 router.get('/', getBatchesWithMetrics);
 router.post('/:batchId/weights', recordWeightSample);
 
