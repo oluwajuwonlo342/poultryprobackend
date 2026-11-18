@@ -16,6 +16,8 @@ if (getMeHandler) router.get('/me', protect, getMeHandler);
 if (forgotPasswordHandler) router.post('/forgot-password', forgotPasswordHandler);
 if (resetPasswordHandler) router.post('/reset-password', resetPasswordHandler);
 
+
+if (authController.verifyEmail) router.post('/verify-email', authController.verifyEmail);
 // Update personal profile (fullName & phone)
 router.put('/profile', protect, async (req, res, next) => {
   try {
