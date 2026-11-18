@@ -39,29 +39,32 @@ exports.register = async (req, res, next) => {
     });
 
     // Assign default FREE subscription plan
+    let subscription = null;
     const freePlan = await SubscriptionPlan.findOne({ code: 'FREE' });
     if (freePlan) {
-      await Subscription.create({
+      const createdSub = await Subscription.create({
         user: user._id,
         plan: freePlan._id,
         planCode: 'FREE',
         status: 'active',
       });
+      subscription = { ...createdSub.toObject(), plan: freePlan };
     }
 
+    // Send welcome/verification email asynchronously via Brevo so signup never hangs
     const verifyUrl = `${process.env.CLIENT_URL}/verify-email?token=${verificationToken}`;
-    await sendEmail({
+    sendEmail({
       to: user.email,
       subject: 'Welcome to PoultryPro — Verify Your Email',
       html: `<p>Hello <strong>${user.fullName}</strong>,</p><p>Welcome to PoultryPro! Click <a href="${verifyUrl}">here to verify your email address</a>.</p>`,
-    });
+    }).catch((err) => console.error('[Register Email Error]:', err.message));
 
-    await ActivityLog.create({
+    ActivityLog.create({
       user: user._id,
       action: 'USER_REGISTERED',
       module: 'Auth',
       details: `New farm owner registered: ${user.email}`,
-    });
+    }).catch((err) => console.error('[ActivityLog Error]:', err.message));
 
     const token = signToken(user._id);
     res.status(201).json({
@@ -75,6 +78,7 @@ exports.register = async (req, res, next) => {
         isEmailVerified: user.isEmailVerified,
       },
       farms: [],
+      subscription,
       requiresOnboarding: true,
     });
   } catch (error) {
@@ -197,11 +201,11 @@ exports.forgotPassword = async (req, res, next) => {
     await user.save({ validateBeforeSave: false });
 
     const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
-    await sendEmail({
+    sendEmail({
       to: user.email,
       subject: 'PoultryPro Password Reset Request',
       html: `<p>Click <a href="${resetUrl}">here to reset your PoultryPro password</a>. This link expires in 1 hour.</p>`,
-    });
+    }).catch((err) => console.error('[ForgotPassword Email Error]:', err.message));
 
     res.json({ message: 'If that email exists, a password reset link has been sent.' });
   } catch (error) {
