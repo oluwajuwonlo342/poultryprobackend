@@ -1,21 +1,21 @@
 const express = require('express');
 const router = express.Router();
+const User = require('../models/User');
+const { protect } = require('../middleware/authMiddleware');
 const {
-  register,
-  login,
+  registerUser,
+  loginUser,
   getMe,
-  verifyEmail,
   forgotPassword,
   resetPassword,
 } = require('../controllers/authController');
-const { protect } = require('../middleware/authMiddleware');
 
-router.post('/register', register);
-router.post('/login', login);
+router.post('/register', registerUser);
+router.post('/login', loginUser);
 router.get('/me', protect, getMe);
-router.post('/verify-email', verifyEmail);
 router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);
+
 // Update personal profile (fullName & phone)
 router.put('/profile', protect, async (req, res, next) => {
   try {
