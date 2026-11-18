@@ -1,15 +1,19 @@
+// server/routes/financeRoutes.js
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const { authorizeFarmAccess } = require('../middleware/farmAccessMiddleware');
 const { requirePlanFeature } = require('../middleware/subscriptionMiddleware');
+const { getDashboardAnalytics } = require('../controllers/financeDashboardController');
 const Expense = require('../models/Expense');
 const Sale = require('../models/Sale');
 
-// Require authenticated user, financial permission, and Starter+ subscription plan
+// 1. Operational Dashboard KPIs & Charts (Accessible on ALL plans, including FREE)
+router.get('/dashboard', protect, authorizeFarmAccess(), getDashboardAnalytics);
+
+// 2. Financial Ledger & Expenses (Requires viewFinancials permission + Starter+ plan)
 router.use(protect, authorizeFarmAccess('viewFinancials'), requirePlanFeature('hasFinancialTracking'));
 
-// List all expenses for the active farm
 router.get('/expenses', async (req, res, next) => {
   try {
     const { category, batchId } = req.query;
@@ -28,7 +32,6 @@ router.get('/expenses', async (req, res, next) => {
   }
 });
 
-// Record a new farm expense
 router.post('/expenses', async (req, res, next) => {
   try {
     const { title, category, amount, expenseDate, paymentMethod, batchId, notes } = req.body;
@@ -55,7 +58,6 @@ router.post('/expenses', async (req, res, next) => {
   }
 });
 
-// Delete an expense entry
 router.delete('/expenses/:expenseId', async (req, res, next) => {
   try {
     const deleted = await Expense.findOneAndDelete({ _id: req.params.expenseId, farm: req.farmId });
@@ -66,7 +68,6 @@ router.delete('/expenses/:expenseId', async (req, res, next) => {
   }
 });
 
-// Get Profit & Loss financial summary
 router.get('/summary', async (req, res, next) => {
   try {
     const [sales, expenses] = await Promise.all([
