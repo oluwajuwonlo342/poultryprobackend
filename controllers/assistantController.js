@@ -9,23 +9,14 @@ const Vaccination = require('../models/Vaccination');
 
 const askFarmAssistant = async (req, res, next) => {
   try {
-    const { question } = req.body;
+    const { question, history = [] } = req.body;
     if (!question || !question.trim()) {
-      return res.status(400).json({ message: 'Please enter a question for the Smart Farm Assistant.' });
+      return res.status(400).json({ message: 'Please enter a message for the assistant.' });
     }
 
     const cleanQuestion = question.trim();
-    const lower = cleanQuestion.toLowerCase();
 
-    // 1. Handle simple greetings immediately
-    const greetingRegex = /^(hi|hello|hey|good morning|good afternoon|good evening|howdy|yo)[\s!.,?]*$/i;
-    if (greetingRegex.test(cleanQuestion)) {
-      return res.json({
-        answer: `Hello ${req.user.fullName.split(' ')[0]}! 👋 I'm your PoultryPro Smart Farm Assistant for **${req.farm.name}**.\n\nAsk me anything about your live flock counts, feed stock, mortality trends, egg production, profit/loss, or general poultry management advice.`,
-      });
-    }
-
-    // 2. Fetch live farm telemetry in parallel
+    // Fetch live farm telemetry in parallel so the AI has accurate context
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const [batches, feeds, recentMortality, recentEggs, sales, expenses, upcomingVaccines] =
       await Promise.all([
@@ -46,139 +37,160 @@ const askFarmAssistant = async (req, res, next) => {
       ]);
 
     const totalBirds = batches.reduce((sum, b) => sum + (b.currentQuantity || 0), 0);
-    const totalFeedKg = feeds.reduce((sum, f) => sum + (f.currentStockKg || 0), 0);
-    const lowFeeds = feeds.filter((f) => f.currentStockKg <= f.lowStockThresholdKg);
     const mortality7d = recentMortality.reduce((sum, r) => sum + (r.mortalityCount || 0), 0);
     const eggs7d = recentEggs.reduce((sum, e) => sum + (e.goodEggs || 0), 0);
     const cratesAvailable = Math.floor((req.farm.eggStockAvailable || 0) / 30);
     const totalRevenue = sales.reduce((sum, s) => sum + (s.totalAmount || 0), 0);
     const totalExpenses = expenses.reduce((sum, e) => sum + (e.amount || 0), 0);
 
-    // 3. Try Groq LLM if GROQ_API_KEY is configured (isolated try/catch so it never throws 404 to UI)
-    const apiKey = process.env.GROQ_API_KEY?.trim();
-    if (apiKey) {
-      try {
-        const farmContext = {
-          farmName: req.farm.name,
-          farmType: req.farm.farmType,
-          location: req.farm.location,
-          totalLiveBirds: totalBirds,
-          activeBatches: batches.map((b) => ({
-            name: b.batchName,
-            category: b.category,
-            breed: b.breed,
-            liveBirds: b.currentQuantity,
-            mortality: b.totalMortality,
-            latestWeightKg: b.latestAvgWeightKg,
-          })),
-          feedInventory: feeds.map((f) => ({
-            name: f.productName,
-            type: f.feedType,
-            remainingKg: f.currentStockKg,
-            lowStockThresholdKg: f.lowStockThresholdKg,
-          })),
-          last7DaysMortality: mortality7d,
-          last7DaysGoodEggs: eggs7d,
-          saleableEggCrates: cratesAvailable,
-          totalRevenueNGN: totalRevenue,
-          totalExpensesNGN: totalExpenses,
-          netProfitNGN: totalRevenue - totalExpenses,
-          upcomingVaccinations: upcomingVaccines.map((v) => ({
-            vaccine: v.vaccineName,
-            batch: v.batch?.batchName,
-            date: v.scheduledDate,
-          })),
-        };
+    const farmContext = {
+      ownerName: req.user.fullName,
+      farmName: req.farm.name,
+      farmType: req.farm.farmType,
+      location: req.farm.location,
+      totalLiveBirds: totalBirds,
+      activeBatches: batches.map((b) => ({
+        name: b.batchName,
+        category: b.category,
+        breed: b.breed,
+        liveBirds: b.currentQuantity,
+        mortality: b.totalMortality,
+        latestWeightKg: b.latestAvgWeightKg,
+      })),
+      feedInventory: feeds.map((f) => ({
+        name: f.productName,
+        type: f.feedType,
+        remainingKg: f.currentStockKg,
+        lowStockThresholdKg: f.lowStockThresholdKg,
+      })),
+      last7DaysMortality: mortality7d,
+      last7DaysGoodEggs: eggs7d,
+      saleableEggCrates: cratesAvailable,
+      totalRevenueNGN: totalRevenue,
+      totalExpensesNGN: totalExpenses,
+      netProfitNGN: totalRevenue - totalExpenses,
+      upcomingVaccinations: upcomingVaccines.map((v) => ({
+        vaccine: v.vaccineName,
+        batch: v.batch?.batchName,
+        date: v.scheduledDate,
+      })),
+    };
 
+    const systemPrompt = `You are a helpful, intelligent, conversational AI assistant built into PoultryPro for ${req.farm.name} in Nigeria.
+Act like a natural, smart AI assistant:
+- Answer ANY question the user asks naturally—whether it's casual conversation, general knowledge, business math, poultry farming/veterinary advice, or specific questions about their farm.
+- Do NOT dump raw farm statistics unless the user asks about their farm, birds, feed, eggs, or finances.
+- When they DO ask about their farm, use the live JSON context below accurately (currency is Naira ₦).
+- Keep answers clear, well-structured, and conversational.
+
+Live Farm Context:
+${JSON.stringify(farmContext)}`;
+
+    // Sanitize prior chat turns (keep last 10 messages)
+    const formattedHistory = Array.isArray(history)
+      ? history
+          .slice(-10)
+          .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+          .map((m) => ({ role: m.role, content: m.content }))
+      : [];
+
+    const groqKey = process.env.GROQ_API_KEY?.trim();
+    const openaiKey = process.env.OPENAI_API_KEY?.trim();
+    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+
+    // Option A: Groq (Free & ultra-fast Llama 3.3 70B)
+    if (groqKey) {
+      try {
         const groqRes = await axios.post(
           'https://api.groq.com/openai/v1/chat/completions',
           {
-            model: 'llama-3.1-8b-instant',
-            temperature: 0.4,
-            max_tokens: 500,
+            model: 'llama-3.3-70b-versatile',
+            temperature: 0.6,
+            max_tokens: 800,
             messages: [
-              {
-                role: 'system',
-                content: `You are PoultryPro AI, an expert poultry veterinarian, nutritionist, and farm business advisor for ${req.farm.name} in Nigeria.
-Rules:
-- Respond naturally, directly, and conversationally to what the user actually asked.
-- Do NOT dump the entire farm database unless the user asks for an overview/summary.
-- If the user asks about their farm, use the live JSON data below accurately (currency is Nigerian Naira ₦).
-- If the user asks general poultry farming questions (e.g. brooding heat, coccidiosis, Lasota vaccine, feed formulation), give practical, actionable poultry advice.
-
-Live Farm Data:
-${JSON.stringify(farmContext)}`,
-              },
-              {
-                role: 'user',
-                content: cleanQuestion,
-              },
+              { role: 'system', content: systemPrompt },
+              ...formattedHistory,
+              { role: 'user', content: cleanQuestion },
             ],
           },
           {
             headers: {
-              Authorization: `Bearer ${apiKey}`,
+              Authorization: `Bearer ${groqKey}`,
               'Content-Type': 'application/json',
             },
-            timeout: 12000,
+            timeout: 15000,
           }
         );
 
-        const aiReply = groqRes.data?.choices?.[0]?.message?.content;
-        if (aiReply) {
-          return res.json({ answer: aiReply.trim() });
-        }
-      } catch (groqErr) {
-        console.error(
-          '[Groq AI Error - Falling back to local engine]:',
-          groqErr.response?.status,
-          groqErr.response?.data || groqErr.message
-        );
+        const reply = groqRes.data?.choices?.[0]?.message?.content;
+        if (reply) return res.json({ answer: reply.trim() });
+      } catch (err) {
+        console.error('[Groq AI Error]:', err.response?.status, err.response?.data || err.message);
       }
     }
 
-    // 4. Smart Intent-Based Fallback (runs cleanly if Groq is unavailable or key is invalid)
-    if (lower.includes('bird') || lower.includes('flock') || lower.includes('batch') || lower.includes('how many')) {
-      const batchLines =
-        batches.length > 0
-          ? batches.map((b) => `• ${b.batchName} (${b.category}): ${b.currentQuantity.toLocaleString()} birds`).join('\n')
-          : '• No active batches recorded yet.';
-      return res.json({
-        answer: `You currently have **${totalBirds.toLocaleString()} live birds** across ${batches.length} active batch(es) on ${req.farm.name}:\n${batchLines}`,
-      });
+    // Option B: OpenAI (if OPENAI_API_KEY is set instead)
+    if (openaiKey) {
+      try {
+        const openaiRes = await axios.post(
+          'https://api.openai.com/v1/chat/completions',
+          {
+            model: 'gpt-4o-mini',
+            temperature: 0.6,
+            max_tokens: 800,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              ...formattedHistory,
+              { role: 'user', content: cleanQuestion },
+            ],
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${openaiKey}`,
+              'Content-Type': 'application/json',
+            },
+            timeout: 15000,
+          }
+        );
+
+        const reply = openaiRes.data?.choices?.[0]?.message?.content;
+        if (reply) return res.json({ answer: reply.trim() });
+      } catch (err) {
+        console.error('[OpenAI Error]:', err.response?.status, err.response?.data || err.message);
+      }
     }
 
-    if (lower.includes('feed') || lower.includes('stock')) {
-      const lowWarning =
-        lowFeeds.length > 0
-          ? `\n⚠️ Low stock alert: ${lowFeeds.map((f) => `${f.productName} (${f.currentStockKg} kg left)`).join(', ')}.`
-          : '\nAll feed products are safely above their reorder thresholds.';
-      return res.json({
-        answer: `You have **${totalFeedKg.toLocaleString()} kg** of feed remaining in inventory.${lowWarning}`,
-      });
+    // Option C: Google Gemini (if GEMINI_API_KEY is set instead)
+    if (geminiKey) {
+      try {
+        const contents = [
+          ...formattedHistory.map((m) => ({
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: m.content }],
+          })),
+          { role: 'user', parts: [{ text: cleanQuestion }] },
+        ];
+
+        const geminiRes = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
+          {
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents,
+          },
+          { timeout: 15000 }
+        );
+
+        const reply = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (reply) return res.json({ answer: reply.trim() });
+      } catch (err) {
+        console.error('[Gemini AI Error]:', err.response?.status, err.response?.data || err.message);
+      }
     }
 
-    if (lower.includes('egg') || lower.includes('crate')) {
-      return res.json({
-        answer: `You have **${cratesAvailable.toLocaleString()} crates** (${(req.farm.eggStockAvailable || 0).toLocaleString()} good eggs) available for sale, with **${eggs7d.toLocaleString()} good eggs** collected over the last 7 days.`,
-      });
-    }
-
-    if (lower.includes('profit') || lower.includes('sales') || lower.includes('revenue') || lower.includes('expense') || lower.includes('money')) {
-      const net = totalRevenue - totalExpenses;
-      return res.json({
-        answer: `Financial snapshot for **${req.farm.name}**:\n• Total Revenue: ₦${totalRevenue.toLocaleString()}\n• Total Expenses: ₦${totalExpenses.toLocaleString()}\n• Net Profit: ₦${net.toLocaleString()}`,
-      });
-    }
-
-    if (lower.includes('mortality') || lower.includes('dead') || lower.includes('sick') || lower.includes('vaccine')) {
-      return res.json({
-        answer: `Recorded mortality over the last 7 days is **${mortality7d} bird(s)**, and you have **${upcomingVaccines.length}** scheduled vaccination(s) upcoming.`,
-      });
-    }
-
+    // If no valid AI API key is active on Render, tell the admin clearly instead of faking an AI
     return res.json({
-      answer: `I can help you check your flock counts, feed stock, egg crates, mortality trends, or farm profit/loss—or answer poultry management questions. What would you like to know about **${req.farm.name}**?`,
+      answer:
+        '⚠️ Live AI is not connected yet because no valid `GROQ_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` is active in your Render server environment variables. Add one of those keys on Render and redeploy to enable full conversational AI.',
     });
   } catch (error) {
     next(error);
