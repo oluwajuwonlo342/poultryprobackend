@@ -1,4 +1,3 @@
-const axios = require('axios');
 const Batch = require('../models/Batch');
 const FeedProduct = require('../models/FeedProduct');
 const DailyRecord = require('../models/DailyRecord');
@@ -6,6 +5,43 @@ const EggProduction = require('../models/EggProduction');
 const Sale = require('../models/Sale');
 const Expense = require('../models/Expense');
 const Vaccination = require('../models/Vaccination');
+
+const callGroqWithFallback = async (apiKey, messages) => {
+  const models = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+  let lastError = 'Unknown Groq error';
+
+  for (const model of models) {
+    try {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.6,
+          max_tokens: 800,
+          messages,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok && data?.choices?.[0]?.message?.content) {
+        return { reply: data.choices[0].message.content.trim(), error: null };
+      }
+
+      lastError = data?.error?.message || `HTTP ${response.status}`;
+      console.error(`[Groq ${model} failed]:`, lastError);
+    } catch (err) {
+      lastError = err.message;
+      console.error(`[Groq ${model} network error]:`, lastError);
+    }
+  }
+
+  return { reply: null, error: lastError };
+};
 
 const askFarmAssistant = async (req, res, next) => {
   try {
@@ -15,6 +51,14 @@ const askFarmAssistant = async (req, res, next) => {
     }
 
     const cleanQuestion = question.trim();
+    const groqKey = (process.env.GROQ_API_KEY || '').replace(/^["']|["']$/g, '').trim();
+
+    if (!groqKey) {
+      return res.json({
+        answer:
+          '⚠️ `GROQ_API_KEY` was not found in `process.env` on this backend service. Make sure it is added under your **Backend Web Service → Environment** on Render and redeployed.',
+      });
+    }
 
     // Fetch live farm telemetry in parallel so the AI has accurate context
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
@@ -86,7 +130,6 @@ Act like a natural, smart AI assistant:
 Live Farm Context:
 ${JSON.stringify(farmContext)}`;
 
-    // Sanitize prior chat turns (keep last 10 messages)
     const formattedHistory = Array.isArray(history)
       ? history
           .slice(-10)
@@ -94,103 +137,20 @@ ${JSON.stringify(farmContext)}`;
           .map((m) => ({ role: m.role, content: m.content }))
       : [];
 
-    const groqKey = process.env.GROQ_API_KEY?.trim();
-    const openaiKey = process.env.OPENAI_API_KEY?.trim();
-    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...formattedHistory,
+      { role: 'user', content: cleanQuestion },
+    ];
 
-    // Option A: Groq (Free & ultra-fast Llama 3.3 70B)
-    if (groqKey) {
-      try {
-        const groqRes = await axios.post(
-          'https://api.groq.com/openai/v1/chat/completions',
-          {
-            model: 'llama-3.3-70b-versatile',
-            temperature: 0.6,
-            max_tokens: 800,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              ...formattedHistory,
-              { role: 'user', content: cleanQuestion },
-            ],
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${groqKey}`,
-              'Content-Type': 'application/json',
-            },
-            timeout: 15000,
-          }
-        );
+    const { reply, error } = await callGroqWithFallback(groqKey, messages);
 
-        const reply = groqRes.data?.choices?.[0]?.message?.content;
-        if (reply) return res.json({ answer: reply.trim() });
-      } catch (err) {
-        console.error('[Groq AI Error]:', err.response?.status, err.response?.data || err.message);
-      }
+    if (reply) {
+      return res.json({ answer: reply });
     }
 
-    // Option B: OpenAI (if OPENAI_API_KEY is set instead)
-    if (openaiKey) {
-      try {
-        const openaiRes = await axios.post(
-          'https://api.openai.com/v1/chat/completions',
-          {
-            model: 'gpt-4o-mini',
-            temperature: 0.6,
-            max_tokens: 800,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              ...formattedHistory,
-              { role: 'user', content: cleanQuestion },
-            ],
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${openaiKey}`,
-              'Content-Type': 'application/json',
-            },
-            timeout: 15000,
-          }
-        );
-
-        const reply = openaiRes.data?.choices?.[0]?.message?.content;
-        if (reply) return res.json({ answer: reply.trim() });
-      } catch (err) {
-        console.error('[OpenAI Error]:', err.response?.status, err.response?.data || err.message);
-      }
-    }
-
-    // Option C: Google Gemini (if GEMINI_API_KEY is set instead)
-    if (geminiKey) {
-      try {
-        const contents = [
-          ...formattedHistory.map((m) => ({
-            role: m.role === 'assistant' ? 'model' : 'user',
-            parts: [{ text: m.content }],
-          })),
-          { role: 'user', parts: [{ text: cleanQuestion }] },
-        ];
-
-        const geminiRes = await axios.post(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
-          {
-            systemInstruction: { parts: [{ text: systemPrompt }] },
-            contents,
-          },
-          { timeout: 15000 }
-        );
-
-        const reply = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (reply) return res.json({ answer: reply.trim() });
-      } catch (err) {
-        console.error('[Gemini AI Error]:', err.response?.status, err.response?.data || err.message);
-      }
-    }
-
-    // If no valid AI API key is active on Render, tell the admin clearly instead of faking an AI
     return res.json({
-      answer:
-        '⚠️ Live AI is not connected yet because no valid `GROQ_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY` is active in your Render server environment variables. Add one of those keys on Render and redeploy to enable full conversational AI.',
+      answer: `⚠️ Groq API error: ${error}. Please verify your GROQ_API_KEY in Render Environment Variables.`,
     });
   } catch (error) {
     next(error);
