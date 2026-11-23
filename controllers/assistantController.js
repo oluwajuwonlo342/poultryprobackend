@@ -17,7 +17,7 @@ const askFarmAssistant = async (req, res, next) => {
     const cleanQuestion = question.trim();
     const lower = cleanQuestion.toLowerCase();
 
-    // 1. Handle simple greetings immediately and warmly
+    // 1. Handle simple greetings immediately
     const greetingRegex = /^(hi|hello|hey|good morning|good afternoon|good evening|howdy|yo)[\s!.,?]*$/i;
     if (greetingRegex.test(cleanQuestion)) {
       return res.json({
@@ -54,50 +54,52 @@ const askFarmAssistant = async (req, res, next) => {
     const totalRevenue = sales.reduce((sum, s) => sum + (s.totalAmount || 0), 0);
     const totalExpenses = expenses.reduce((sum, e) => sum + (e.amount || 0), 0);
 
-    // 3. Use Groq LLM if GROQ_API_KEY is configured on Render / .env
-    if (process.env.GROQ_API_KEY) {
-      const farmContext = {
-        farmName: req.farm.name,
-        farmType: req.farm.farmType,
-        location: req.farm.location,
-        totalLiveBirds: totalBirds,
-        activeBatches: batches.map((b) => ({
-          name: b.batchName,
-          category: b.category,
-          breed: b.breed,
-          liveBirds: b.currentQuantity,
-          mortality: b.totalMortality,
-          latestWeightKg: b.latestAvgWeightKg,
-        })),
-        feedInventory: feeds.map((f) => ({
-          name: f.productName,
-          type: f.feedType,
-          remainingKg: f.currentStockKg,
-          lowStockThresholdKg: f.lowStockThresholdKg,
-        })),
-        last7DaysMortality: mortality7d,
-        last7DaysGoodEggs: eggs7d,
-        saleableEggCrates: cratesAvailable,
-        totalRevenueNGN: totalRevenue,
-        totalExpensesNGN: totalExpenses,
-        netProfitNGN: totalRevenue - totalExpenses,
-        upcomingVaccinations: upcomingVaccines.map((v) => ({
-          vaccine: v.vaccineName,
-          batch: v.batch?.batchName,
-          date: v.scheduledDate,
-        })),
-      };
+    // 3. Try Groq LLM if GROQ_API_KEY is configured (isolated try/catch so it never throws 404 to UI)
+    const apiKey = process.env.GROQ_API_KEY?.trim();
+    if (apiKey) {
+      try {
+        const farmContext = {
+          farmName: req.farm.name,
+          farmType: req.farm.farmType,
+          location: req.farm.location,
+          totalLiveBirds: totalBirds,
+          activeBatches: batches.map((b) => ({
+            name: b.batchName,
+            category: b.category,
+            breed: b.breed,
+            liveBirds: b.currentQuantity,
+            mortality: b.totalMortality,
+            latestWeightKg: b.latestAvgWeightKg,
+          })),
+          feedInventory: feeds.map((f) => ({
+            name: f.productName,
+            type: f.feedType,
+            remainingKg: f.currentStockKg,
+            lowStockThresholdKg: f.lowStockThresholdKg,
+          })),
+          last7DaysMortality: mortality7d,
+          last7DaysGoodEggs: eggs7d,
+          saleableEggCrates: cratesAvailable,
+          totalRevenueNGN: totalRevenue,
+          totalExpensesNGN: totalExpenses,
+          netProfitNGN: totalRevenue - totalExpenses,
+          upcomingVaccinations: upcomingVaccines.map((v) => ({
+            vaccine: v.vaccineName,
+            batch: v.batch?.batchName,
+            date: v.scheduledDate,
+          })),
+        };
 
-      const groqRes = await axios.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        {
-          model: 'llama-3.3-70b-versatile',
-          temperature: 0.4,
-          max_tokens: 500,
-          messages: [
-            {
-              role: 'system',
-              content: `You are PoultryPro AI, an expert poultry veterinarian, nutritionist, and farm business advisor for ${req.farm.name} in Nigeria.
+        const groqRes = await axios.post(
+          'https://api.groq.com/openai/v1/chat/completions',
+          {
+            model: 'llama-3.1-8b-instant',
+            temperature: 0.4,
+            max_tokens: 500,
+            messages: [
+              {
+                role: 'system',
+                content: `You are PoultryPro AI, an expert poultry veterinarian, nutritionist, and farm business advisor for ${req.farm.name} in Nigeria.
 Rules:
 - Respond naturally, directly, and conversationally to what the user actually asked.
 - Do NOT dump the entire farm database unless the user asks for an overview/summary.
@@ -106,29 +108,36 @@ Rules:
 
 Live Farm Data:
 ${JSON.stringify(farmContext)}`,
-            },
-            {
-              role: 'user',
-              content: cleanQuestion,
-            },
-          ],
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-            'Content-Type': 'application/json',
+              },
+              {
+                role: 'user',
+                content: cleanQuestion,
+              },
+            ],
           },
-          timeout: 12000,
-        }
-      );
+          {
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            timeout: 12000,
+          }
+        );
 
-      const aiReply = groqRes.data?.choices?.[0]?.message?.content;
-      if (aiReply) {
-        return res.json({ answer: aiReply.trim() });
+        const aiReply = groqRes.data?.choices?.[0]?.message?.content;
+        if (aiReply) {
+          return res.json({ answer: aiReply.trim() });
+        }
+      } catch (groqErr) {
+        console.error(
+          '[Groq AI Error - Falling back to local engine]:',
+          groqErr.response?.status,
+          groqErr.response?.data || groqErr.message
+        );
       }
     }
 
-    // 4. Smart Intent-Based Fallback (when GROQ_API_KEY is not set)
+    // 4. Smart Intent-Based Fallback (runs cleanly if Groq is unavailable or key is invalid)
     if (lower.includes('bird') || lower.includes('flock') || lower.includes('batch') || lower.includes('how many')) {
       const batchLines =
         batches.length > 0
