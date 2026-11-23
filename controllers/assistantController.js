@@ -6,8 +6,44 @@ const Sale = require('../models/Sale');
 const Expense = require('../models/Expense');
 const Vaccination = require('../models/Vaccination');
 
+const getAvailableGroqModels = async (apiKey) => {
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/models', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const allIds = (data.data || [])
+      .map((m) => m.id)
+      .filter((id) => id && !id.includes('whisper') && !id.includes('guard') && !id.includes('tts'));
+
+    // Prioritize strong conversational models first if enabled on the account
+    const preferredOrder = [
+      'llama-3.3-70b-versatile',
+      'meta-llama/llama-4-scout-17b-16e-instruct',
+      'meta-llama/llama-4-maverick-17b-128e-instruct',
+      'qwen/qwen3-32b',
+      'llama-3.1-8b-instant',
+      'gemma2-9b-it',
+    ];
+
+    const sorted = [
+      ...preferredOrder.filter((id) => allIds.includes(id)),
+      ...allIds.filter((id) => !preferredOrder.includes(id)),
+    ];
+    return sorted;
+  } catch {
+    return [];
+  }
+};
+
 const callGroqWithFallback = async (apiKey, messages) => {
-  const models = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+  const discovered = await getAvailableGroqModels(apiKey);
+  const models =
+    discovered.length > 0
+      ? discovered.slice(0, 4)
+      : ['llama-3.3-70b-versatile', 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3-32b'];
+
   let lastError = 'Unknown Groq error';
 
   for (const model of models) {
@@ -60,7 +96,6 @@ const askFarmAssistant = async (req, res, next) => {
       });
     }
 
-    // Fetch live farm telemetry in parallel so the AI has accurate context
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const [batches, feeds, recentMortality, recentEggs, sales, expenses, upcomingVaccines] =
       await Promise.all([
@@ -150,7 +185,7 @@ ${JSON.stringify(farmContext)}`;
     }
 
     return res.json({
-      answer: `⚠️ Groq API error: ${error}. Please verify your GROQ_API_KEY in Render Environment Variables.`,
+      answer: `⚠️ Groq API error: ${error}. Check your Groq Console → Settings → Limits/Models to confirm an active chat model is enabled for your key.`,
     });
   } catch (error) {
     next(error);
