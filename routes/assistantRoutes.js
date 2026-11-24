@@ -2,9 +2,18 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const { authorizeFarmAccess } = require('../middleware/farmAccessMiddleware');
-const { requirePlanFeature } = require('../middleware/subscriptionMiddleware');
-const { askFarmAssistant } = require('../controllers/assistantController');
+const {
+  askFarmAssistant,
+  getConversations,
+  getConversationById,
+  deleteConversation,
+} = require('../controllers/assistantController');
 
-router.post('/ask', protect, authorizeFarmAccess(), requirePlanFeature('hasSmartAssistant'), askFarmAssistant);
+router.use(protect, authorizeFarmAccess());
+
+router.get('/conversations', getConversations);
+router.get('/conversations/:id', getConversationById);
+router.delete('/conversations/:id', deleteConversation);
+router.post('/ask', askFarmAssistant);
 
 module.exports = router;
