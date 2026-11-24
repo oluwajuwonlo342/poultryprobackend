@@ -1,3 +1,4 @@
+const AssistantConversation = require('../models/AssistantConversation');
 const Batch = require('../models/Batch');
 const FeedProduct = require('../models/FeedProduct');
 const DailyRecord = require('../models/DailyRecord');
@@ -17,7 +18,6 @@ const getAvailableGroqModels = async (apiKey) => {
       .map((m) => m.id)
       .filter((id) => id && !id.includes('whisper') && !id.includes('guard') && !id.includes('tts'));
 
-    // Prioritize strong conversational models first if enabled on the account
     const preferredOrder = [
       'llama-3.3-70b-versatile',
       'meta-llama/llama-4-scout-17b-16e-instruct',
@@ -27,11 +27,10 @@ const getAvailableGroqModels = async (apiKey) => {
       'gemma2-9b-it',
     ];
 
-    const sorted = [
+    return [
       ...preferredOrder.filter((id) => allIds.includes(id)),
       ...allIds.filter((id) => !preferredOrder.includes(id)),
     ];
-    return sorted;
   } catch {
     return [];
   }
@@ -79,9 +78,72 @@ const callGroqWithFallback = async (apiKey, messages) => {
   return { reply: null, error: lastError };
 };
 
+// List all saved conversations for the current user & active farm
+const getConversations = async (req, res, next) => {
+  try {
+    const conversations = await AssistantConversation.find({
+      user: req.user._id,
+      farm: req.farmId,
+    })
+      .select('title updatedAt createdAt messages')
+      .sort({ updatedAt: -1 })
+      .limit(30);
+
+    const formatted = conversations.map((c) => ({
+      _id: c._id,
+      title: c.title,
+      messageCount: c.messages.length,
+      updatedAt: c.updatedAt,
+    }));
+
+    res.json(formatted);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Get a single saved conversation with full message history
+const getConversationById = async (req, res, next) => {
+  try {
+    const conversation = await AssistantConversation.findOne({
+      _id: req.params.id,
+      user: req.user._id,
+      farm: req.farmId,
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ message: 'Conversation not found.' });
+    }
+
+    res.json(conversation);
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Delete a saved conversation
+const deleteConversation = async (req, res, next) => {
+  try {
+    const deleted = await AssistantConversation.findOneAndDelete({
+      _id: req.params.id,
+      user: req.user._id,
+      farm: req.farmId,
+    });
+
+    if (!deleted) {
+      return res.status(404).json({ message: 'Conversation not found.' });
+    }
+
+    res.json({ message: 'Conversation deleted.' });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Ask AI and persist both user & assistant messages into MongoDB
 const askFarmAssistant = async (req, res, next) => {
   try {
-    const { question, history = [] } = req.body;
+    const { question, conversationId } = req.body;
     if (!question || !question.trim()) {
       return res.status(400).json({ message: 'Please enter a message for the assistant.' });
     }
@@ -96,6 +158,28 @@ const askFarmAssistant = async (req, res, next) => {
       });
     }
 
+    // Load existing conversation or prepare a new one
+    let conversation = null;
+    if (conversationId) {
+      conversation = await AssistantConversation.findOne({
+        _id: conversationId,
+        user: req.user._id,
+        farm: req.farmId,
+      });
+    }
+
+    if (!conversation) {
+      const autoTitle =
+        cleanQuestion.length > 42 ? `${cleanQuestion.slice(0, 42)}...` : cleanQuestion;
+      conversation = new AssistantConversation({
+        user: req.user._id,
+        farm: req.farmId,
+        title: autoTitle,
+        messages: [],
+      });
+    }
+
+    // Fetch live farm telemetry in parallel
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const [batches, feeds, recentMortality, recentEggs, sales, expenses, upcomingVaccines] =
       await Promise.all([
@@ -165,31 +249,49 @@ Act like a natural, smart AI assistant:
 Live Farm Context:
 ${JSON.stringify(farmContext)}`;
 
-    const formattedHistory = Array.isArray(history)
-      ? history
-          .slice(-10)
-          .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-          .map((m) => ({ role: m.role, content: m.content }))
-      : [];
+    // Use the last 12 saved messages from this conversation for context
+    const priorHistory = conversation.messages.slice(-12).map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
 
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...formattedHistory,
+      ...priorHistory,
       { role: 'user', content: cleanQuestion },
     ];
 
     const { reply, error } = await callGroqWithFallback(groqKey, messages);
 
-    if (reply) {
-      return res.json({ answer: reply });
+    if (!reply) {
+      return res.json({
+        answer: `⚠️ Groq API error: ${error}. Check your Groq Console → Settings → Limits/Models to confirm an active chat model is enabled for your key.`,
+      });
     }
 
+    // Save both turns to MongoDB
+    conversation.messages.push(
+      { role: 'user', content: cleanQuestion },
+      { role: 'assistant', content: reply }
+    );
+    await conversation.save();
+
     return res.json({
-      answer: `⚠️ Groq API error: ${error}. Check your Groq Console → Settings → Limits/Models to confirm an active chat model is enabled for your key.`,
+      answer: reply,
+      conversation: {
+        _id: conversation._id,
+        title: conversation.title,
+        updatedAt: conversation.updatedAt,
+      },
     });
   } catch (error) {
     next(error);
   }
 };
 
-module.exports = { askFarmAssistant };
+module.exports = {
+  askFarmAssistant,
+  getConversations,
+  getConversationById,
+  deleteConversation,
+};
